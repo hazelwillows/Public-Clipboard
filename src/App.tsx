@@ -61,10 +61,24 @@ export default function App() {
     }
   };
 
+  // Generate or retrieve persistent clientId for device session tracking
+  const clientIdRef = useRef<string>(() => {
+    if (typeof window !== 'undefined') {
+      let id = sessionStorage.getItem('pub_clip_client_id');
+      if (!id) {
+        id = `device-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+        sessionStorage.setItem('pub_clip_client_id', id);
+      }
+      return id;
+    }
+    return 'device-default';
+  });
+
   // Initial fetch of clipboard data
   const fetchClipboard = useCallback(async (targetRoom: string) => {
     try {
-      const res = await fetch(`/api/clipboard?room=${encodeURIComponent(targetRoom)}`);
+      const clientId = typeof clientIdRef.current === 'function' ? clientIdRef.current() : clientIdRef.current;
+      const res = await fetch(`/api/clipboard?room=${encodeURIComponent(targetRoom)}&clientId=${encodeURIComponent(clientId)}`);
       if (res.ok) {
         const json = await res.json();
         const data: ClipboardData = json.data;
@@ -78,61 +92,67 @@ export default function App() {
           setHistory(data.history || []);
           setLastSavedAt(data.updatedAt);
         }
-        setActiveClientsCount(json.activeClientsCount || 1);
+        if (typeof json.activeClientsCount === 'number') {
+          setActiveClientsCount(json.activeClientsCount);
+        }
         setIsConnected(true);
       }
     } catch (err) {
       console.error('Fetch clipboard error:', err);
-      setIsConnected(false);
     }
   }, []);
 
-  // Connect to SSE for real-time updates
+  // Connect to SSE for real-time updates with fast Polling fallback
   useEffect(() => {
     fetchClipboard(roomId);
 
-    const eventSource = new EventSource(`/api/events?room=${encodeURIComponent(roomId)}`);
+    let eventSource: EventSource | null = null;
+    try {
+      eventSource = new EventSource(`/api/events?room=${encodeURIComponent(roomId)}`);
 
-    eventSource.onopen = () => {
-      setIsConnected(true);
-    };
+      eventSource.onopen = () => {
+        setIsConnected(true);
+      };
 
-    eventSource.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data);
-        if (payload.type === 'init' || payload.type === 'update') {
-          const data: ClipboardData = payload.data;
-          if (data.version > lastKnownVersionRef.current) {
-            lastKnownVersionRef.current = data.version;
-            if (!isTypingRef.current) {
-              setText(data.text || '');
+      eventSource.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.type === 'init' || payload.type === 'update') {
+            const data: ClipboardData = payload.data;
+            if (data.version > lastKnownVersionRef.current) {
+              lastKnownVersionRef.current = data.version;
+              if (!isTypingRef.current) {
+                setText(data.text || '');
+              }
+              setFiles(data.files || []);
+              setVersion(data.version);
+              setHistory(data.history || []);
+              setLastSavedAt(data.updatedAt);
             }
-            setFiles(data.files || []);
-            setVersion(data.version);
-            setHistory(data.history || []);
-            setLastSavedAt(data.updatedAt);
+            if (typeof payload.activeClientsCount === 'number') {
+              setActiveClientsCount(payload.activeClientsCount);
+            }
+            setIsConnected(true);
           }
-          if (typeof payload.activeClientsCount === 'number') {
-            setActiveClientsCount(payload.activeClientsCount);
-          }
-          setIsConnected(true);
+        } catch (e) {
+          console.error('SSE parse error:', e);
         }
-      } catch (e) {
-        console.error('SSE parse error:', e);
-      }
-    };
+      };
 
-    eventSource.onerror = () => {
-      setIsConnected(false);
-    };
+      eventSource.onerror = () => {
+        // SSE might be restricted on Vercel Serverless; don't break UI, keep polling active
+      };
+    } catch (e) {
+      console.error('SSE creation error:', e);
+    }
 
-    // Polling fallback every 3 seconds
+    // High frequency polling (1.5s) guarantees cross-device sync everywhere
     const interval = setInterval(() => {
       fetchClipboard(roomId);
-    }, 3000);
+    }, 1500);
 
     return () => {
-      eventSource.close();
+      if (eventSource) eventSource.close();
       clearInterval(interval);
     };
   }, [roomId, fetchClipboard]);

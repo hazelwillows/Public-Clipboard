@@ -5,22 +5,28 @@ import multer from 'multer';
 import { createServer as createViteServer } from 'vite';
 import { ClipboardData, UploadedFile, TextSnapshot } from './src/types';
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const app = express();
 
 // Enable JSON & URL encoded bodies (up to 50MB for large text pastes)
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Set up directories
-const DATA_DIR = path.join(process.cwd(), 'data');
-const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
+// Set up directories - use /tmp on Vercel/Serverless where process.cwd() is read-only
+const isVercel = process.env.VERCEL === '1' || process.env.NOW_BUILDER === '1';
+const BASE_DIR = isVercel ? '/tmp' : process.cwd();
+const DATA_DIR = path.join(BASE_DIR, 'data');
+const UPLOADS_DIR = path.join(BASE_DIR, 'uploads');
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+try {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(UPLOADS_DIR)) {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  }
+} catch (err) {
+  console.error('Error creating storage directories:', err);
 }
 
 // Serve uploaded files statically
@@ -96,6 +102,32 @@ function getOrCreateRoom(roomId: string = 'global'): ClipboardData {
   return store[cleanRoomId];
 }
 
+// Track active polling/device sessions with heartbeat timestamps
+const activeSessions = new Map<string, { roomId: string; lastSeen: number }>();
+
+function recordHeartbeat(clientId: string, roomId: string) {
+  activeSessions.set(clientId, { roomId, lastSeen: Date.now() });
+}
+
+function cleanupSessions() {
+  const now = Date.now();
+  for (const [id, session] of activeSessions.entries()) {
+    if (now - session.lastSeen > 10000) { // 10 seconds timeout
+      activeSessions.delete(id);
+    }
+  }
+}
+
+function getActiveClientsCount(roomId: string): number {
+  cleanupSessions();
+  const cleanRoomId = roomId.trim().toLowerCase() || 'global';
+  let count = 0;
+  for (const session of activeSessions.values()) {
+    if (session.roomId === cleanRoomId) count++;
+  }
+  return Math.max(1, count); // Return at least 1 for current device
+}
+
 // SSE Clients connections tracking
 interface SSEClient {
   id: string;
@@ -108,7 +140,7 @@ const sseClients: SSEClient[] = [];
 function broadcastToRoom(roomId: string, data: ClipboardData) {
   const cleanRoomId = roomId.trim().toLowerCase() || 'global';
   const clientsInRoom = sseClients.filter((client) => client.roomId === cleanRoomId);
-  const payload = `data: ${JSON.stringify({ type: 'update', data, activeClientsCount: clientsInRoom.length })}\n\n`;
+  const payload = `data: ${JSON.stringify({ type: 'update', data, activeClientsCount: getActiveClientsCount(roomId) })}\n\n`;
 
   clientsInRoom.forEach((client) => {
     try {
@@ -119,16 +151,14 @@ function broadcastToRoom(roomId: string, data: ClipboardData) {
   });
 }
 
-function getActiveClientsCount(roomId: string): number {
-  const cleanRoomId = roomId.trim().toLowerCase() || 'global';
-  return sseClients.filter((client) => client.roomId === cleanRoomId).length;
-}
-
 // --- API Endpoints ---
 
 // GET /api/clipboard
 app.get('/api/clipboard', (req: Request, res: Response) => {
   const roomId = (req.query.room as string) || 'global';
+  const clientId = (req.query.clientId as string) || req.ip || 'client-default';
+  recordHeartbeat(clientId, roomId);
+
   const roomData = getOrCreateRoom(roomId);
   res.json({
     data: roomData,
@@ -140,10 +170,11 @@ app.get('/api/clipboard', (req: Request, res: Response) => {
 app.post('/api/clipboard', (req: Request, res: Response) => {
   const roomId = (req.body.roomId as string) || 'global';
   const text = typeof req.body.text === 'string' ? req.body.text : '';
+  const clientId = (req.body.clientId as string) || req.ip || 'client-default';
+  recordHeartbeat(clientId, roomId);
 
   const room = getOrCreateRoom(roomId);
   
-  // Create snapshot if text changed significantly
   if (text !== room.text) {
     room.text = text;
     room.version += 1;
@@ -233,14 +264,13 @@ app.delete('/api/files/:fileId', (req: Request, res: Response) => {
 // POST /api/clipboard/clear
 app.post('/api/clipboard/clear', (req: Request, res: Response) => {
   const roomId = (req.body.roomId as string) || 'global';
-  const target = req.body.target || 'all'; // 'text', 'files', 'all'
+  const target = req.body.target || 'all';
   const room = getOrCreateRoom(roomId);
 
   if (target === 'text' || target === 'all') {
     room.text = '';
   }
   if (target === 'files' || target === 'all') {
-    // optional: clean up upload files from disk
     room.files.forEach((file) => {
       const filePath = path.join(UPLOADS_DIR, file.filename);
       if (fs.existsSync(filePath)) {
@@ -267,17 +297,16 @@ app.post('/api/clipboard/clear', (req: Request, res: Response) => {
 app.get('/api/events', (req: Request, res: Response) => {
   const roomId = ((req.query.room as string) || 'global').trim().toLowerCase();
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-  });
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.status(200);
 
   const clientId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   const client: SSEClient = { id: clientId, roomId, res };
   sseClients.push(client);
 
-  // Send initial data
   const roomData = getOrCreateRoom(roomId);
   res.write(
     `data: ${JSON.stringify({
@@ -287,10 +316,13 @@ app.get('/api/events', (req: Request, res: Response) => {
     })}\n\n`
   );
 
-  // Send ping every 20 seconds to keep SSE connection alive
   const heartbeat = setInterval(() => {
-    res.write(`: heartbeat\n\n`);
-  }, 20000);
+    try {
+      res.write(`: heartbeat\n\n`);
+    } catch (e) {
+      clearInterval(heartbeat);
+    }
+  }, 15000);
 
   req.on('close', () => {
     clearInterval(heartbeat);
@@ -301,25 +333,32 @@ app.get('/api/events', (req: Request, res: Response) => {
   });
 });
 
-// --- Vite and Production Server Setup ---
-async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+// --- Vite and Standalone Server Setup ---
+if (process.env.NODE_ENV !== 'production') {
+  createViteServer({
+    server: { middlewareMode: true },
+    appType: 'spa',
+  }).then((vite) => {
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    if (!isVercel) {
+      app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Public Clipboard Dev Server running on http://0.0.0.0:${PORT}`);
+      });
+    }
+  });
+} else {
+  const distPath = path.join(process.cwd(), 'dist');
+  app.use(express.static(distPath));
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
+
+  if (!isVercel) {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Public Clipboard Production Server running on http://0.0.0.0:${PORT}`);
     });
   }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Public Clipboard Server running on http://0.0.0.0:${PORT}`);
-  });
 }
 
-startServer();
+export default app;
+
