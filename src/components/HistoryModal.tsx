@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, History, RotateCcw, Clock, FileText } from 'lucide-react';
+import { X, History, RotateCcw, Clock, Trash2 } from 'lucide-react';
 import { TextSnapshot } from '../types';
 
 interface HistoryModalProps {
@@ -7,6 +7,7 @@ interface HistoryModalProps {
   onClose: () => void;
   snapshots: TextSnapshot[];
   onRestore: (text: string) => void;
+  onClearHistory?: () => void;
 }
 
 export const HistoryModal: React.FC<HistoryModalProps> = ({
@@ -14,8 +15,17 @@ export const HistoryModal: React.FC<HistoryModalProps> = ({
   onClose,
   snapshots,
   onRestore,
+  onClearHistory,
 }) => {
   if (!isOpen) return null;
+
+  const handleEraseClick = () => {
+    if (confirm('Are you sure you want to permanently delete all history snapshots and erase them from Firebase? This action cannot be undone.')) {
+      if (onClearHistory) {
+        onClearHistory();
+      }
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 animate-fade-in">
@@ -89,10 +99,20 @@ export const HistoryModal: React.FC<HistoryModalProps> = ({
           )}
         </div>
 
-        <div className="pt-3 border-t border-slate-800 text-center">
+        {/* Footer with Clear History Option */}
+        <div className="pt-3 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-3">
           <p className="text-[11px] text-slate-500">
-            Snapshots are automatically captured when major text changes occur
+            Snapshots are automatically captured during major edits
           </p>
+          {snapshots.length > 0 && onClearHistory && (
+            <button
+              onClick={handleEraseClick}
+              className="w-full sm:w-auto bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 hover:text-rose-200 text-xs px-3 py-1.5 rounded-xl font-medium flex items-center justify-center gap-1.5 transition-all shrink-0"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+              Erase All History
+            </button>
+          )}
         </div>
       </div>
     </div>

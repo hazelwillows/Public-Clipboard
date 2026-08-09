@@ -283,6 +283,9 @@ app.post('/api/clipboard/clear', (req: Request, res: Response) => {
     });
     room.files = [];
   }
+  if (target === 'history' || target === 'all') {
+    room.history = [];
+  }
 
   room.version += 1;
   room.updatedAt = new Date().toISOString();

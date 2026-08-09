@@ -370,6 +370,37 @@ export default function App() {
     showToast('Restored previous text version');
   };
 
+  const handleClearHistory = async () => {
+    try {
+      const cleanRoom = roomId.trim().toLowerCase() || 'global';
+      const docRef = doc(db, 'clipboards', cleanRoom);
+      const now = new Date().toISOString();
+
+      setHistory([]);
+
+      await setDoc(
+        docRef,
+        {
+          history: [],
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+
+      fetch('/api/clipboard/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: cleanRoom, target: 'history' }),
+      }).catch(() => {});
+
+      showToast('History records permanently erased from Firebase');
+      setIsHistoryModalOpen(false);
+    } catch (err) {
+      console.error('Clear history error:', err);
+      showToast('Failed to erase history');
+    }
+  };
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-indigo-600 selection:text-white">
       {/* Toast Banner */}
@@ -457,6 +488,7 @@ export default function App() {
         onClose={() => setIsHistoryModalOpen(false)}
         snapshots={history}
         onRestore={handleRestoreHistory}
+        onClearHistory={handleClearHistory}
       />
     </div>
   );
