@@ -5,6 +5,8 @@ import { FileUploadZone } from './components/FileUploadZone';
 import { QRCodeModal } from './components/QRCodeModal';
 import { HistoryModal } from './components/HistoryModal';
 import { ClipboardData, UploadedFile, TextSnapshot } from './types';
+import { db } from './firebase';
+import { doc, onSnapshot, setDoc, collection } from 'firebase/firestore';
 import { Smartphone, Monitor, ShieldCheck, Zap, RefreshCw, Layers, Sparkles } from 'lucide-react';
 
 export default function App() {
@@ -21,7 +23,7 @@ export default function App() {
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [version, setVersion] = useState<number>(1);
   const [history, setHistory] = useState<TextSnapshot[]>([]);
-  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [isConnected, setIsConnected] = useState<boolean>(true);
   const [activeClientsCount, setActiveClientsCount] = useState<number>(1);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
@@ -37,7 +39,23 @@ export default function App() {
   const isTypingRef = useRef<boolean>(false);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const saveDebounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const lastKnownVersionRef = useRef<number>(0);
+
+  // Persistent clientId for active device presence
+  const clientIdRef = useRef<string>(() => {
+    if (typeof window !== 'undefined') {
+      let id = sessionStorage.getItem('pub_clip_client_id');
+      if (!id) {
+        id = `device-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+        sessionStorage.setItem('pub_clip_client_id', id);
+      }
+      return id;
+    }
+    return 'device-default';
+  });
+
+  const getClientId = (): string => {
+    return typeof clientIdRef.current === 'function' ? clientIdRef.current() : clientIdRef.current;
+  };
 
   // Toast notification helper
   const showToast = (msg: string) => {
@@ -61,103 +79,88 @@ export default function App() {
     }
   };
 
-  // Generate or retrieve persistent clientId for device session tracking
-  const clientIdRef = useRef<string>(() => {
-    if (typeof window !== 'undefined') {
-      let id = sessionStorage.getItem('pub_clip_client_id');
-      if (!id) {
-        id = `device-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-        sessionStorage.setItem('pub_clip_client_id', id);
-      }
-      return id;
-    }
-    return 'device-default';
-  });
+  // Connect to Firestore real-time listener for board data + active devices presence
+  useEffect(() => {
+    const cleanRoom = roomId.trim().toLowerCase() || 'global';
+    const clientId = getClientId();
 
-  // Initial fetch of clipboard data
-  const fetchClipboard = useCallback(async (targetRoom: string) => {
-    try {
-      const clientId = typeof clientIdRef.current === 'function' ? clientIdRef.current() : clientIdRef.current;
-      const res = await fetch(`/api/clipboard?room=${encodeURIComponent(targetRoom)}&clientId=${encodeURIComponent(clientId)}`);
-      if (res.ok) {
-        const json = await res.json();
-        const data: ClipboardData = json.data;
-        if (data.version > lastKnownVersionRef.current) {
-          lastKnownVersionRef.current = data.version;
+    // 1. Subscribe to Clipboard document in Firestore
+    const docRef = doc(db, 'clipboards', cleanRoom);
+    const unsubClipboard = onSnapshot(
+      docRef,
+      (docSnap) => {
+        setIsConnected(true);
+        if (docSnap.exists()) {
+          const data = docSnap.data() as ClipboardData;
           if (!isTypingRef.current) {
             setText(data.text || '');
           }
           setFiles(data.files || []);
-          setVersion(data.version);
+          setVersion(data.version || 1);
           setHistory(data.history || []);
-          setLastSavedAt(data.updatedAt);
+          setLastSavedAt(data.updatedAt || new Date().toISOString());
+        } else {
+          // Initialize document in Firestore if not yet present
+          const initData: ClipboardData = {
+            roomId: cleanRoom,
+            text: 'Welcome to the Public Clipboard!\n\nType anything here or drop files below. Everything synced in real-time across any connected device, laptop, or phone.',
+            files: [],
+            version: 1,
+            updatedAt: new Date().toISOString(),
+            history: [
+              {
+                id: 'init-1',
+                text: 'Welcome to the Public Clipboard!\n\nType anything here or drop files below. Everything synced in real-time across any connected device, laptop, or phone.',
+                timestamp: new Date().toISOString(),
+                preview: 'Welcome to the Public Clipboard...',
+              },
+            ],
+          };
+          setDoc(docRef, initData, { merge: true });
         }
-        if (typeof json.activeClientsCount === 'number') {
-          setActiveClientsCount(json.activeClientsCount);
-        }
-        setIsConnected(true);
+      },
+      (err) => {
+        console.error('Firestore onSnapshot error:', err);
+        setIsConnected(false);
       }
-    } catch (err) {
-      console.error('Fetch clipboard error:', err);
-    }
-  }, []);
+    );
 
-  // Connect to SSE for real-time updates with fast Polling fallback
-  useEffect(() => {
-    fetchClipboard(roomId);
+    // 2. Presence heartbeat for counting active devices
+    const presenceDocRef = doc(db, 'clipboards', cleanRoom, 'presence', clientId);
+    const sendHeartbeat = () => {
+      setDoc(presenceDocRef, { clientId, lastSeen: Date.now() }, { merge: true }).catch(() => {});
+    };
+    sendHeartbeat();
+    const heartbeatTimer = setInterval(sendHeartbeat, 4000);
 
-    let eventSource: EventSource | null = null;
-    try {
-      eventSource = new EventSource(`/api/events?room=${encodeURIComponent(roomId)}`);
-
-      eventSource.onopen = () => {
-        setIsConnected(true);
-      };
-
-      eventSource.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data);
-          if (payload.type === 'init' || payload.type === 'update') {
-            const data: ClipboardData = payload.data;
-            if (data.version > lastKnownVersionRef.current) {
-              lastKnownVersionRef.current = data.version;
-              if (!isTypingRef.current) {
-                setText(data.text || '');
-              }
-              setFiles(data.files || []);
-              setVersion(data.version);
-              setHistory(data.history || []);
-              setLastSavedAt(data.updatedAt);
-            }
-            if (typeof payload.activeClientsCount === 'number') {
-              setActiveClientsCount(payload.activeClientsCount);
-            }
-            setIsConnected(true);
+    // 3. Presence collection listener to calculate active devices connected
+    const presenceColRef = collection(db, 'clipboards', cleanRoom, 'presence');
+    const unsubPresence = onSnapshot(
+      presenceColRef,
+      (snapshot) => {
+        const now = Date.now();
+        let activeCount = 0;
+        snapshot.forEach((pDoc) => {
+          const pData = pDoc.data();
+          if (pData.lastSeen && now - pData.lastSeen < 12000) {
+            activeCount++;
           }
-        } catch (e) {
-          console.error('SSE parse error:', e);
-        }
-      };
-
-      eventSource.onerror = () => {
-        // SSE might be restricted on Vercel Serverless; don't break UI, keep polling active
-      };
-    } catch (e) {
-      console.error('SSE creation error:', e);
-    }
-
-    // High frequency polling (1.5s) guarantees cross-device sync everywhere
-    const interval = setInterval(() => {
-      fetchClipboard(roomId);
-    }, 1500);
+        });
+        setActiveClientsCount(Math.max(1, activeCount));
+      },
+      (err) => {
+        console.error('Presence error:', err);
+      }
+    );
 
     return () => {
-      if (eventSource) eventSource.close();
-      clearInterval(interval);
+      unsubClipboard();
+      unsubPresence();
+      clearInterval(heartbeatTimer);
     };
-  }, [roomId, fetchClipboard]);
+  }, [roomId]);
 
-  // Handle local text typing with server auto-sync
+  // Handle local text typing with instant Firestore sync
   const handleTextChange = (newText: string) => {
     setText(newText);
     isTypingRef.current = true;
@@ -168,29 +171,62 @@ export default function App() {
       isTypingRef.current = false;
     }, 1200);
 
-    // Debounce save request to server
+    // Debounce save request to Firestore (300ms)
     if (saveDebounceTimeoutRef.current) clearTimeout(saveDebounceTimeoutRef.current);
     saveDebounceTimeoutRef.current = setTimeout(async () => {
       try {
-        const res = await fetch('/api/clipboard', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ roomId, text: newText }),
-        });
-        if (res.ok) {
-          const json = await res.json();
-          const updated: ClipboardData = json.data;
-          lastKnownVersionRef.current = updated.version;
-          setVersion(updated.version);
-          setHistory(updated.history || []);
-          setLastSavedAt(updated.updatedAt);
+        const cleanRoom = roomId.trim().toLowerCase() || 'global';
+        const docRef = doc(db, 'clipboards', cleanRoom);
+        const now = new Date().toISOString();
+
+        // Calculate snapshot history
+        const newHistory = [...history];
+        const lastSnapshot = newHistory[0];
+        if (
+          !lastSnapshot ||
+          Math.abs(lastSnapshot.text.length - newText.length) > 10 ||
+          Date.now() - new Date(lastSnapshot.timestamp).getTime() > 60000
+        ) {
+          newHistory.unshift({
+            id: `snap-${Date.now()}`,
+            text: newText,
+            timestamp: now,
+            preview: newText.slice(0, 60).replace(/\n/g, ' ') || '(empty)',
+          });
+          if (newHistory.length > 20) {
+            newHistory.slice(0, 20);
+          }
         }
+
+        const newVersion = version + 1;
+        await setDoc(
+          docRef,
+          {
+            text: newText,
+            version: newVersion,
+            updatedAt: now,
+            history: newHistory,
+          },
+          { merge: true }
+        );
+
+        setLastSavedAt(now);
       } catch (err) {
-        console.error('Save error:', err);
+        console.error('Firestore save error:', err);
       } finally {
         setIsSaving(false);
       }
-    }, 350);
+    }, 300);
+  };
+
+  // Helper to convert small/medium files to data URLs for bulletproof cross-platform persistence
+  const fileToDataURL = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
   };
 
   // File upload handler
@@ -198,32 +234,68 @@ export default function App() {
     if (!uploadFiles || uploadFiles.length === 0) return;
 
     setIsUploading(true);
-    const formData = new FormData();
-    formData.append('roomId', roomId);
-
-    Array.from(uploadFiles).forEach((f) => {
-      formData.append('files', f);
-    });
+    const cleanRoom = roomId.trim().toLowerCase() || 'global';
+    const newFiles: UploadedFile[] = [];
 
     try {
-      const res = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData,
-      });
+      // First attempt server upload for large files
+      const formData = new FormData();
+      formData.append('roomId', cleanRoom);
+      Array.from(uploadFiles).forEach((f) => formData.append('files', f));
 
-      if (res.ok) {
-        const json = await res.json();
-        const updated: ClipboardData = json.data;
-        lastKnownVersionRef.current = updated.version;
-        setFiles(updated.files || []);
-        setVersion(updated.version);
-        setLastSavedAt(updated.updatedAt);
-        showToast(`${uploadFiles.length} ${uploadFiles.length === 1 ? 'file' : 'files'} uploaded successfully!`);
-      } else {
-        showToast('Upload failed');
+      let serverFiles: UploadedFile[] = [];
+      try {
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          body: formData,
+        });
+        if (res.ok) {
+          const json = await res.json();
+          serverFiles = json.files || [];
+        }
+      } catch (e) {
+        console.warn('Server upload endpoint bypassed or failed, falling back to data URL:', e);
       }
+
+      // If server upload returned files, use them. Otherwise convert files to data URL
+      if (serverFiles.length > 0) {
+        newFiles.push(...serverFiles);
+      } else {
+        for (const file of Array.from(uploadFiles)) {
+          let dataUrl = '';
+          if (file.size < 10 * 1024 * 1024) { // Under 10MB
+            dataUrl = await fileToDataURL(file);
+          }
+          newFiles.push({
+            id: `file-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+            filename: file.name,
+            originalName: file.name,
+            mimeType: file.type || 'application/octet-stream',
+            size: file.size,
+            url: dataUrl || '',
+            uploadedAt: new Date().toISOString(),
+          });
+        }
+      }
+
+      const updatedFileList = [...newFiles, ...files];
+      const docRef = doc(db, 'clipboards', cleanRoom);
+      const now = new Date().toISOString();
+
+      await setDoc(
+        docRef,
+        {
+          files: updatedFileList,
+          version: version + 1,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+
+      setLastSavedAt(now);
+      showToast(`${uploadFiles.length} ${uploadFiles.length === 1 ? 'file' : 'files'} attached successfully!`);
     } catch (err) {
-      console.error('Upload error:', err);
+      console.error('File upload error:', err);
       showToast('Error uploading file');
     } finally {
       setIsUploading(false);
@@ -233,40 +305,53 @@ export default function App() {
   // Delete attached file
   const handleDeleteFile = async (fileId: string) => {
     try {
-      const res = await fetch(`/api/files/${fileId}?room=${encodeURIComponent(roomId)}`, {
-        method: 'DELETE',
-      });
-      if (res.ok) {
-        const json = await res.json();
-        const updated: ClipboardData = json.data;
-        lastKnownVersionRef.current = updated.version;
-        setFiles(updated.files || []);
-        setVersion(updated.version);
-        showToast('File removed');
-      }
+      const cleanRoom = roomId.trim().toLowerCase() || 'global';
+      const updatedFiles = files.filter((f) => f.id !== fileId);
+      const docRef = doc(db, 'clipboards', cleanRoom);
+      const now = new Date().toISOString();
+
+      await setDoc(
+        docRef,
+        {
+          files: updatedFiles,
+          version: version + 1,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+
+      // Also call server API clean up if possible
+      fetch(`/api/files/${fileId}?room=${encodeURIComponent(cleanRoom)}`, { method: 'DELETE' }).catch(() => {});
+
+      showToast('File removed');
     } catch (err) {
-      console.error('Delete error:', err);
+      console.error('Delete file error:', err);
     }
   };
 
   // Clear board
   const handleClearBoard = async () => {
-    if (confirm('Are you sure you want to clear the text and attached files on this public board?')) {
+    if (confirm('Are you sure you want to clear text and files on this public board?')) {
       try {
-        const res = await fetch('/api/clipboard/clear', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ roomId, target: 'all' }),
-        });
-        if (res.ok) {
-          const json = await res.json();
-          const updated: ClipboardData = json.data;
-          lastKnownVersionRef.current = updated.version;
-          setText('');
-          setFiles([]);
-          setVersion(updated.version);
-          showToast('Public clipboard cleared');
-        }
+        const cleanRoom = roomId.trim().toLowerCase() || 'global';
+        const docRef = doc(db, 'clipboards', cleanRoom);
+        const now = new Date().toISOString();
+
+        setText('');
+        setFiles([]);
+
+        await setDoc(
+          docRef,
+          {
+            text: '',
+            files: [],
+            version: version + 1,
+            updatedAt: now,
+          },
+          { merge: true }
+        );
+
+        showToast('Public clipboard cleared');
       } catch (err) {
         console.error('Clear error:', err);
       }
@@ -276,7 +361,7 @@ export default function App() {
   const handleCopyAll = () => {
     navigator.clipboard.writeText(text);
     setHasCopiedHeader(true);
-    showToast('Copied all text to clipboard');
+    showToast('Copied text to clipboard');
     setTimeout(() => setHasCopiedHeader(false), 2000);
   };
 
@@ -316,10 +401,10 @@ export default function App() {
           <div>
             <div className="flex items-center gap-2 text-indigo-400 text-xs font-semibold uppercase tracking-wider mb-1">
               <Sparkles className="w-3.5 h-3.5" />
-              <span>Instant Cross-Device Synchronization</span>
+              <span>Real-Time Cloud Synchronization</span>
             </div>
             <p className="text-xs sm:text-sm text-slate-300">
-              Anything typed or dropped below is publicly accessible in real-time. Scan the QR code or share the URL to open it on your phone or another computer.
+              Anything typed or attached below is publicly accessible across all devices live. Scan the QR code or share the URL to sync your phone, laptop, or tablet!
             </p>
           </div>
 
@@ -355,7 +440,7 @@ export default function App() {
       {/* Footer */}
       <footer className="border-t border-slate-900 bg-slate-950 py-4 text-center text-xs text-slate-500">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <span>Public Clipboard — Real-time Notepad & File Hub</span>
+          <span>Public Clipboard — Firebase Powered Live Sync</span>
           <span className="text-slate-600">Channel #{roomId}</span>
         </div>
       </footer>

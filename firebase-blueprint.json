@@ -1,0 +1,15 @@
+{
+  "entities": {
+    "clipboards": {
+      "title": "Clipboards",
+      "description": "Public real-time clipboards synced across devices",
+      "fields": {
+        "text": { "type": "string", "description": "Board text content" },
+        "files": { "type": "array", "description": "Attached file items" },
+        "version": { "type": "number", "description": "Data version count" },
+        "updatedAt": { "type": "string", "description": "Timestamp ISO" },
+        "history": { "type": "array", "description": "Text history snapshots" }
+      }
+    }
+  }
+}
