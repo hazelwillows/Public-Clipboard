@@ -1,0 +1,6 @@
+{
+  "name": "Public Clipboard",
+  "description": "A real-time public live notepad and file sharing hub accessible across all devices instantly.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
